@@ -1709,6 +1709,91 @@ describe("oauth2 - sign-up account creation rollback", async () => {
 });
 
 /**
+ * @see https://github.com/better-auth/better-auth/issues/11880
+ */
+describe("oauth2 - user.create.before veto on sign-up", async () => {
+	const vetoedEmail = "vetoed-oauth@example.com";
+	const { auth, client, cookieSetter } = await getTestInstance({
+		socialProviders: {
+			google: {
+				clientId: "test",
+				clientSecret: "test",
+				enabled: true,
+			},
+		},
+		databaseHooks: {
+			user: {
+				create: {
+					async before(user) {
+						if (user.email === vetoedEmail) return false;
+					},
+				},
+			},
+		},
+	});
+
+	const ctx = await auth.$context;
+
+	it("aborts with a FAILED_TO_CREATE_USER error instead of crashing", async () => {
+		const errorSpy = vi.spyOn(ctx.logger, "error");
+
+		server.use(
+			http.post("https://oauth2.googleapis.com/token", async () => {
+				const profile = {
+					sub: "google_vetoed_11880",
+					email: vetoedEmail,
+					email_verified: true,
+					name: "Vetoed User",
+				};
+				const idToken = await signJWT(profile, DEFAULT_SECRET);
+				return HttpResponse.json({
+					access_token: "test_token",
+					id_token: idToken,
+				});
+			}),
+		);
+
+		const oAuthHeaders = new Headers();
+		const signInRes = await client.signIn.social({
+			provider: "google",
+			callbackURL: "/",
+			fetchOptions: {
+				onSuccess: cookieSetter(oAuthHeaders),
+			},
+		});
+		const state = new URL(signInRes.data!.url!).searchParams.get("state") || "";
+		let redirectLocation = "";
+		await client.$fetch("/callback/google", {
+			query: { state, code: "test_code" },
+			method: "GET",
+			headers: oAuthHeaders,
+			onError(context) {
+				expect(context.response.status).toBe(302);
+				redirectLocation = context.response.headers.get("location") || "";
+			},
+		});
+
+		expect(redirectLocation).toContain("error=FAILED_TO_CREATE_USER");
+		expect(errorSpy).not.toHaveBeenCalledWith(
+			"Unable to create OAuth user",
+			expect.anything(),
+		);
+		errorSpy.mockRestore();
+
+		const user = await ctx.adapter.findOne<User>({
+			model: "user",
+			where: [{ field: "email", value: vetoedEmail }],
+		});
+		expect(user).toBeNull();
+		const accounts = await ctx.adapter.findMany<{ accountId: string }>({
+			model: "account",
+			where: [{ field: "accountId", value: "google_vetoed_11880" }],
+		});
+		expect(accounts).toHaveLength(0);
+	});
+});
+
+/**
  * @see https://github.com/better-auth/better-auth/issues/8906
  *
  * Regression: linkSocial callback looked up the provider subject without its
